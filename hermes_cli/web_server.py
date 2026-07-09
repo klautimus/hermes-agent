@@ -4256,6 +4256,7 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
     "kanban_decomposer",
     "profile_describer",
     "curator",
+    "advisor",
 )
 
 
@@ -4486,6 +4487,101 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
     except Exception:
         _log.exception("PUT /api/model/moa failed")
         raise HTTPException(status_code=500, detail="Failed to save MoA config")
+
+
+# ── Advisor endpoints ────────────────────────────────────────────────
+
+class AdvisorPromptsPayload(BaseModel):
+    system_prompt: str = ""
+    executor_guidance: str = ""
+
+
+@app.get("/api/advisor/prompts")
+async def get_advisor_prompts(profile: Optional[str] = None):
+    """Return the current advisor prompts (system prompt + executor guidance)."""
+    try:
+        with _profile_scope(profile):
+            cfg = load_config()
+        # The prompts are stored in the tool's default constants, but can be overridden
+        # via config. We return the effective values.
+        from tools.advisor import _ADVISOR_SYSTEM_PROMPT as default_system
+        from agent.prompt_builder import ADVISOR_GUIDANCE as default_guidance
+
+        aux_cfg = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
+        advisor_cfg = aux_cfg.get("advisor", {}) if isinstance(aux_cfg, dict) else {}
+
+        system_prompt = advisor_cfg.get("system_prompt", "") or default_system
+        # Executor guidance is in prompt_builder.py, not configurable yet
+        executor_guidance = default_guidance
+
+        return {
+            "system_prompt": system_prompt,
+            "executor_guidance": executor_guidance,
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("GET /api/advisor/prompts failed")
+        raise HTTPException(status_code=500, detail="Failed to read advisor prompts")
+
+
+@app.put("/api/advisor/prompts")
+async def set_advisor_prompts(body: AdvisorPromptsPayload, profile: Optional[str] = None):
+    """Persist the advisor system prompt and executor guidance.
+    Note: executor_guidance is in prompt_builder.py source code; only system_prompt
+    is persisted to config.yaml. The UI can edit both but only system_prompt saves.
+    """
+    try:
+        with _profile_scope(profile):
+            cfg = load_config()
+
+        aux_cfg = cfg.get("auxiliary", {})
+        if not isinstance(aux_cfg, dict):
+            aux_cfg = {}
+        advisor_cfg = aux_cfg.get("advisor", {})
+        if not isinstance(advisor_cfg, dict):
+            advisor_cfg = {}
+
+        # Only system_prompt is persisted to config
+        advisor_cfg["system_prompt"] = body.system_prompt or ""
+        aux_cfg["advisor"] = advisor_cfg
+        cfg["auxiliary"] = aux_cfg
+
+        save_config(cfg)
+        return {"ok": True, "system_prompt": body.system_prompt}
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("PUT /api/advisor/prompts failed")
+        raise HTTPException(status_code=500, detail="Failed to save advisor prompts")
+
+
+@app.post("/api/advisor/test")
+async def test_advisor(body: dict, profile: Optional[str] = None):
+    """Test the advisor by sending a consultation request."""
+    try:
+        question = body.get("question", "Say 'advisor working' if you receive this.")
+        context = body.get("context", "Test message from dashboard.")
+
+        # Use the advisor tool directly
+        from tools.advisor import consult_advisor
+        import json
+
+        result = consult_advisor(question=question, context=context)
+        parsed = json.loads(result)
+
+        return {
+            "success": parsed.get("success", False),
+            "advisor_response": parsed.get("advisor_response", ""),
+            "provider": parsed.get("provider", ""),
+            "model": parsed.get("model", ""),
+            "error": parsed.get("error"),
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("POST /api/advisor/test failed")
+        raise HTTPException(status_code=500, detail="Failed to test advisor")
 
 
 @app.post("/api/model/set")

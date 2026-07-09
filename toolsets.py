@@ -79,6 +79,10 @@ _HERMES_CORE_TOOLS = [
     "computer_use",
 ]
 
+# Advisor toolset — on-demand consultation with a secondary model
+# Disabled by default; enable via `hermes tools enable advisor`
+_ADVISOR_TOOLS = ["consult_advisor"]
+
 # Webhook events may originate from untrusted third-party content (for example,
 # public PR titles/comments). Keep the default webhook toolset intentionally
 # constrained to avoid local file/system execution by prompt injection.
@@ -321,6 +325,12 @@ TOOLSETS = {
             "spotify_playback", "spotify_devices", "spotify_queue", "spotify_search",
             "spotify_playlists", "spotify_albums", "spotify_library",
         ],
+        "includes": []
+    },
+
+    "advisor": {
+        "description": "Strategic advisor (the brain): does ALL thinking — analysis, planning, architecture, design, debugging strategy, task decomposition. Executor provides context, gets plan, executes.",
+        "tools": _ADVISOR_TOOLS,
         "includes": []
     },
 

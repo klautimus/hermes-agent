@@ -1647,6 +1647,23 @@ DEFAULT_CONFIG = {
             "timeout": 900,
             "extra_body": {},
         },
+        # Advisor — on-demand consultation for decisions, design plans, and complex research.
+        # The executor (main chat model) calls the advisor via the `consult_advisor` tool
+        # when it needs strategic guidance. Advisor runs on a separate model/provider
+        # (default: GLM-5.2 via Nvidia) to keep executor tokens cheap while getting
+        # high-quality analysis. Set visible_advice=false to hide advisor responses.
+        "advisor": {
+            "provider": "nvidia",
+            "model": "glm-5.2",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {},
+            "system_prompt": "",
+            "temperature": 0.7,
+            "max_tokens": 0,
+            "visible_advice": True,
+        },
         "moa_aggregator": {
             "provider": "auto",
             "model": "",
@@ -2187,6 +2204,11 @@ DEFAULT_CONFIG = {
         # override the output directory.
         "save_traces": False,
         "trace_dir": "",
+        # When true, emit each reference model's output as a visible message
+        # in the gateway (Discord, Telegram, etc.) so users can see the
+        # reference-aggregator pipeline in real time. Off by default to avoid
+        # message spam; enable for debugging/visibility.
+        "show_references": False,
         "presets": {
             "default": {
                 "reference_models": [

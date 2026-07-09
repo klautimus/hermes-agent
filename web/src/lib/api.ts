@@ -491,6 +491,21 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  // Advisor endpoints
+  getAdvisorConfig: () => fetchJSON<AdvisorConfigResponse>("/api/model/auxiliary"),
+  getAdvisorPrompts: () => fetchJSON<AdvisorPromptsResponse>("/api/advisor/prompts"),
+  saveAdvisorPrompts: (body: AdvisorPromptsResponse) =>
+    fetchJSON<{ ok: boolean }>("/api/advisor/prompts", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  testAdvisor: (body: AdvisorTestRequest) =>
+    fetchJSON<AdvisorTestResponse>("/api/advisor/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   saveConfig: (config: Record<string, unknown>) =>
     fetchJSON<{ ok: boolean }>("/api/config", {
       method: "PUT",
@@ -2179,6 +2194,42 @@ export interface ModelAssignmentResponse {
    *  Switching main never clears aux pins; this lets the UI warn the user
    *  their helper tasks aren't following the switch. Only set on scope:'main'. */
   stale_aux?: StaleAuxAssignment[];
+}
+
+// ── Advisor types ────────────────────────────────────────────────────
+
+export interface AdvisorConfigResponse {
+  provider: string;
+  model: string;
+  base_url: string;
+  api_key: string;
+  timeout: number;
+  extra_body: Record<string, unknown>;
+  system_prompt: string;
+  temperature: number;
+  max_tokens: number;
+  visible_advice: boolean;
+  max_retries: number;
+  retry_base_delay: number;
+}
+
+export interface AdvisorPromptsResponse {
+  system_prompt: string;
+  executor_guidance: string;
+}
+
+export interface AdvisorTestRequest {
+  question: string;
+  context: string;
+}
+
+export interface AdvisorTestResponse {
+  success: boolean;
+  advisor_response?: string;
+  provider?: string;
+  model?: string;
+  visible?: boolean;
+  error?: string;
 }
 
 // ── OAuth provider types ────────────────────────────────────────────────

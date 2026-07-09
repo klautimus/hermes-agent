@@ -55,6 +55,7 @@ const AUX_TASKS: readonly { key: string; label: string; hint: string }[] = [
   { key: "kanban_decomposer", label: "Kanban Decomposer", hint: "Task decomposition" },
   { key: "profile_describer", label: "Profile Describer", hint: "Auto profile descriptions" },
   { key: "curator", label: "Curator", hint: "Skill-usage review" },
+  { key: "advisor", label: "Strategic Advisor", hint: "The brain: planning, decisions, architecture" },
 ] as const;
 
 function formatTokens(n: number): string {

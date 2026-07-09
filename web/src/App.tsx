@@ -22,6 +22,7 @@ import {
   Activity,
   BarChart3,
   BookOpen,
+  Brain,
   Clock,
   Code,
   Cpu,
@@ -91,6 +92,7 @@ import ChannelsPage from "@/pages/ChannelsPage";
 import WebhooksPage from "@/pages/WebhooksPage";
 import SystemPage from "@/pages/SystemPage";
 import ChatPage from "@/pages/ChatPage";
+import AdvisorPage from "@/pages/AdvisorPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -150,6 +152,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/config": ConfigPage,
   "/env": EnvPage,
   "/docs": DocsPage,
+  "/advisor": AdvisorPage,
 };
 
 // Route placeholder for /chat.  The persistent ChatPage host (rendered
@@ -179,6 +182,11 @@ const BUILTIN_NAV_REST: NavItem[] = [
     labelKey: "models",
     label: "Models",
     icon: Cpu,
+  },
+  {
+    path: "/advisor",
+    label: "Advisor",
+    icon: Brain,
   },
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
