@@ -36,6 +36,10 @@ _HERMES_CORE_TOOLS = [
     "computer_use",
 ]
 
+# Advisor toolset — on-demand consultation with a secondary (strategic) model.
+# Disabled by default; enable via `hermes tools enable advisor`.
+_ADVISOR_TOOLS = ["consult_advisor"]
+
 # Webhook payloads are untrusted third-party content: no file/system execution.
 _HERMES_WEBHOOK_SAFE_TOOLS = ["web_search", "web_extract", "vision_analyze", "clarify"]
 _HA_TOOLS = ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"]
@@ -160,6 +164,13 @@ TOOLSETS = {
         "Native Spotify playback, search, playlist, album, and library tools",
         ["spotify_playback", "spotify_devices", "spotify_queue", "spotify_search",
          "spotify_playlists", "spotify_albums", "spotify_library"],
+    ),
+
+    # Advisor — on-demand consultation with a secondary (strategic) model.
+    "advisor": _ts(
+        "Strategic advisor (the brain): does ALL thinking - analysis, planning, architecture, "
+        "design, debugging strategy, task decomposition. Executor provides context, gets plan, executes.",
+        _ADVISOR_TOOLS,
     ),
 
     # Scenario-specific toolsets
