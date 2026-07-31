@@ -1,0 +1,7 @@
+name: minimax-video
+version: 1.1.0
+description: "MiniMax video generation backend. MiniMax-H3 (v2 API): text-to-video, image-to-video (first/last frame), reference-to-video, 2K, 4-15s. MiniMax-Hailuo-2.3 (v1 API): legacy text-to-video, image-to-video, first-and-last-frame, and character-reference (face-consistency) modes."
+author: Hermes Agent Community
+kind: backend
+requires_env:
+  - MINIMAX_API_KEY
