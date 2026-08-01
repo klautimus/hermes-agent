@@ -392,3 +392,157 @@ def test_minimax_error_message_envelope():
     assert "insufficient balance" in msg
 
     assert _minimax_error_message("not json at all", "fallback") == "fallback"
+
+
+# ---------------------------------------------------------------------------
+# H3 model routing + regression guards
+# ---------------------------------------------------------------------------
+
+
+def test_h3_capabilities_no_args_matches_default_model():
+    """The tool calls capabilities() with NO args — the no-arg default must
+    be the H3 surface (the active default model), not the v1 surface."""
+    from plugins.video_gen.minimax import MinimaxVideoGenProvider
+
+    caps = MinimaxVideoGenProvider().capabilities()
+    assert caps["resolutions"] == ["2K"]
+    assert caps["min_duration"] == 4
+    assert caps["max_duration"] == 15
+    assert caps["max_reference_images"] == 9
+
+
+def test_is_h3_model_exact_match():
+    from plugins.video_gen.minimax import _is_h3_model
+
+    assert _is_h3_model("MiniMax-H3") is True
+    assert _is_h3_model("minimax-h3") is True
+    assert _is_h3_model("h3") is True
+    assert _is_h3_model("MiniMax-Hailuo-2.3") is False
+    assert _is_h3_model("h30") is False  # substring footgun guard
+    assert _is_h3_model("h3b") is False
+    assert _is_h3_model("") is False
+    assert _is_h3_model(None) is False
+
+
+def test_h3_payload_reference_mode_ratio_passthrough():
+    """r2v allows an explicit concrete ratio per the docs (optional, defaults
+    adaptive); a valid v2 ratio should pass through, an unsupported one
+    should fall back to adaptive."""
+    from plugins.video_gen.minimax import _build_h3_payload
+
+    payload, note, mode = _build_h3_payload(
+        prompt_text="style",
+        image_url=None,
+        reference_image_urls=[
+            "https://example.com/r1.jpg",
+            "https://example.com/r2.jpg",
+            "https://example.com/r3.jpg",
+        ],
+        duration=None,
+        aspect_ratio="9:16",
+    )
+    assert mode == "reference"
+    assert payload["ratio"] == "9:16"
+    assert note is None
+
+    payload, note, _mode = _build_h3_payload(
+        prompt_text="style",
+        image_url=None,
+        reference_image_urls=[
+            "https://example.com/r1.jpg",
+            "https://example.com/r2.jpg",
+            "https://example.com/r3.jpg",
+        ],
+        duration=None,
+        aspect_ratio="3:2",  # not in the v2 enum → adaptive fallback
+    )
+    assert payload["ratio"] == "adaptive"
+    assert note is None
+
+
+# ---------------------------------------------------------------------------
+# H3 end-to-end generate() with mocked HTTP (submit → poll → download → save)
+# ---------------------------------------------------------------------------
+
+
+def test_h3_generate_full_flow_with_mocked_http(monkeypatch):
+    import plugins.video_gen.minimax as mm
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-key")
+    monkeypatch.setenv("MINIMAX_API_HOST", "https://api.minimax.io")
+
+    captured = {}
+
+    async def _submit_impl(client, payload, *, api_key, base_url):
+        captured["payload"] = payload
+        captured["url"] = f"{base_url}/v2/video_generation"
+        return "task-123"
+
+    async def _poll_impl(client, task_id, *, api_key, base_url, timeout_seconds, poll_interval):
+        captured["task_id"] = task_id
+        captured["poll_url"] = f"{base_url}/v2/query/video_generation/{task_id}"
+        return {
+            "status": "succeeded",
+            "body": {
+                "task": {
+                    "status": "succeeded",
+                    "content": {"url": "https://cdn.example/out.mp4"},
+                    "task_type": "generation",
+                    "ratio": "16:9",
+                }
+            },
+        }
+
+    async def _fetch_impl(client, url, timeout=120):
+        captured["download_url"] = url
+        return b"VIDEOBINARYDATA"
+
+    from pathlib import Path
+
+    monkeypatch.setattr(mm, "_submit_h3_task", _submit_impl)
+    monkeypatch.setattr(mm, "_poll_h3_task", _poll_impl)
+    monkeypatch.setattr(mm, "_fetch_video_bytes", _fetch_impl)
+    monkeypatch.setattr(mm, "save_bytes_video", lambda raw, prefix, extension: Path("/tmp/test-video.mp4"))
+
+    result = mm.MinimaxVideoGenProvider().generate(
+        "a test video",
+        model="MiniMax-H3",
+        seed=42,
+        resolution="1080P",
+        duration=10,
+        aspect_ratio="16:9",
+    )
+
+    assert result["success"] is True
+    assert result["video"] == "/tmp/test-video.mp4"
+    assert result["model"] == "MiniMax-H3"
+    assert result["modality"] == "text"
+    # success_response() flattens `extra` items into the top-level dict
+    assert result["api_version"] == "v2"
+    assert result["task_id"] == "task-123"
+    assert result["seed_dropped"] is True
+    assert result["resolution_requested"] == "1080P"
+    assert result["actual_ratio"] == "16:9"
+    assert captured["url"].endswith("/v2/video_generation")
+    assert captured["poll_url"].endswith("/v2/query/video_generation/task-123")
+    assert captured["payload"]["model"] == "MiniMax-H3"
+    assert captured["payload"]["resolution"] == "2K"
+    assert captured["payload"]["duration"] == 10
+    assert "seed" not in captured["payload"]
+    assert captured["download_url"] == "https://cdn.example/out.mp4"
+
+
+def test_h3_generate_body_size_guard(monkeypatch):
+    import plugins.video_gen.minimax as mm
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-key")
+    # Tiny cap so any real payload trips the guard before network I/O.
+    monkeypatch.setattr(mm, "H3_MAX_BODY_BYTES", 100)
+
+    result = mm.MinimaxVideoGenProvider().generate(
+        "a test video",
+        model="MiniMax-H3",
+        image_url="data:image/png;base64," + "A" * 500,
+    )
+    assert result["success"] is False
+    assert result["error_type"] == "payload_too_large"
