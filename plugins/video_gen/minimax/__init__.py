@@ -262,8 +262,16 @@ async def _fetch_video_bytes(
 
 
 def _is_h3_model(model: Optional[str]) -> bool:
-    """True when the model identifier targets the H3 (v2 API) backend."""
-    return bool(model) and "h3" in str(model).lower()
+    """True when the model identifier targets the H3 (v2 API) backend.
+
+    Exact match on the canonical id, plus a bare ``h3`` alias. Substring
+    matching is deliberately avoided — a future ``h30``/``h3b`` model
+    must NOT route to the v2 path.
+    """
+    if not model:
+        return False
+    normalized = str(model).strip().lower()
+    return normalized == H3_MODEL.lower() or normalized == "h3"
 
 
 def _build_h3_image_item(url: str, role: str) -> Dict[str, Any]:
@@ -327,12 +335,19 @@ def _resolve_h3_ratio(
 ) -> Tuple[str, Optional[str]]:
     """Return ``(ratio, adjustment_note)`` for the H3 v2 API.
 
-    Image / reference modes: ratio is always ``adaptive`` (the API derives
-    it from the input; concrete values are ignored).
+    Image (i2v) mode: ratio is always ``adaptive`` — the API derives it
+    from the input image; concrete values are ignored.
+    Reference (r2v) mode: ratio is optional and defaults to ``adaptive``;
+    a concrete v2 ratio may be passed through when explicitly requested.
     Text mode: ratio is required and cannot be ``adaptive`` — map the
     unified-surface value onto the v2 enum.
     """
-    if mode != "text":
+    if mode == "image":
+        return "adaptive", None
+    if mode == "reference":
+        ar = (aspect_ratio or "").strip()
+        if ar in H3_VALID_RATIOS:
+            return ar, None
         return "adaptive", None
     ar = (aspect_ratio or "").strip() or DEFAULT_ASPECT_RATIO
     if ar == "adaptive":
@@ -1068,6 +1083,13 @@ async def _generate_h3_video_async(
             extra["cdn_url"] = download_url
         if duration is not None:
             extra["duration_requested"] = int(duration)
+        if seed is not None:
+            # v2 API has no seed parameter — make the drop explicit so the
+            # caller knows reproducibility was not honored.
+            extra["seed_dropped"] = True
+        if resolution and resolution.strip().upper() != H3_RESOLUTION:
+            # H3 is 2K-only; surface that the requested resolution was replaced.
+            extra["resolution_requested"] = resolution
         if task_obj.get("task_type"):
             extra["task_type"] = str(task_obj["task_type"])
         if task_obj.get("ratio"):
