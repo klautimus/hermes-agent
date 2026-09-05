@@ -1,0 +1,7 @@
+name: web-trafilatura
+version: 1.0.0
+description: "Trafilatura web content extraction — free, local, no API key needed."
+author: NousResearch
+kind: backend
+provides_web_providers:
+  - trafilatura
