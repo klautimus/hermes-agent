@@ -511,12 +511,13 @@ def test_h3_generate_full_flow_with_mocked_http(monkeypatch):
         resolution="1080P",
         duration=10,
         aspect_ratio="16:9",
+        reference_video_urls=["https://example.com/ref.mp4"],
     )
 
     assert result["success"] is True
     assert result["video"] == "/tmp/test-video.mp4"
     assert result["model"] == "MiniMax-H3"
-    assert result["modality"] == "text"
+    assert result["modality"] == "image"  # reference mode counts as image-driven
     # success_response() flattens `extra` items into the top-level dict
     assert result["api_version"] == "v2"
     assert result["task_id"] == "task-123"
@@ -530,6 +531,11 @@ def test_h3_generate_full_flow_with_mocked_http(monkeypatch):
     assert captured["payload"]["duration"] == 10
     assert "seed" not in captured["payload"]
     assert captured["download_url"] == "https://cdn.example/out.mp4"
+    # reference video reached the wire as a v2 content item
+    non_text = [i for i in captured["payload"]["content"] if i["type"] != "text"]
+    assert non_text == [
+        {"type": "video_url", "video_url": {"url": "https://example.com/ref.mp4"}, "role": "reference_video"}
+    ]
 
 
 def test_h3_generate_body_size_guard(monkeypatch):
@@ -546,3 +552,140 @@ def test_h3_generate_body_size_guard(monkeypatch):
     )
     assert result["success"] is False
     assert result["error_type"] == "payload_too_large"
+
+
+# ---------------------------------------------------------------------------
+# Reference video / audio (v2 reference_video + reference_audio roles)
+# ---------------------------------------------------------------------------
+
+
+def test_build_media_input_urls_and_data_uris():
+    from plugins.video_gen.minimax import _build_media_input
+
+    assert _build_media_input("https://example.com/clip.mp4") == {"url": "https://example.com/clip.mp4"}
+    assert _build_media_input("data:video/mp4;base64,YWJj") == {"url": "data:video/mp4;base64,YWJj"}
+    assert _build_media_input("data:audio/mp3;base64,YWJj") == {"url": "data:audio/mp3;base64,YWJj"}
+    assert _build_media_input("") is None
+    assert _build_media_input("not-a-url-or-file") is None
+    # image data URIs are NOT accepted by the media helper (images use _build_image_input)
+    assert _build_media_input("data:image/png;base64,YWJj") is None
+
+
+def test_h3_payload_reference_video_mode():
+    from plugins.video_gen.minimax import _build_h3_payload
+
+    payload, note, mode = _build_h3_payload(
+        prompt_text="match this motion",
+        image_url=None,
+        reference_image_urls=None,
+        reference_video_urls=["https://example.com/motion.mp4"],
+        reference_audio_urls=None,
+        duration=None,
+        aspect_ratio=None,
+    )
+    assert mode == "reference"
+    assert payload["ratio"] == "adaptive"
+    items = [i for i in payload["content"] if i["type"] != "text"]
+    assert items == [
+        {"type": "video_url", "video_url": {"url": "https://example.com/motion.mp4"}, "role": "reference_video"}
+    ]
+    assert note is None
+
+
+def test_h3_payload_reference_video_audio_and_images_mixed():
+    """Images + video + audio refs together → all become reference roles."""
+    from plugins.video_gen.minimax import _build_h3_payload
+
+    payload, _note, mode = _build_h3_payload(
+        prompt_text="full reference stack",
+        image_url="https://example.com/style.jpg",
+        reference_image_urls=["https://example.com/char.jpg"],
+        reference_video_urls=[
+            "https://example.com/a.mp4",
+            "https://example.com/b.mp4",
+            "https://example.com/c.mp4",
+        ],
+        reference_audio_urls=["https://example.com/vocals.wav"],
+        duration=None,
+        aspect_ratio="16:9",
+    )
+    assert mode == "reference"
+    assert payload["ratio"] == "16:9"  # r2v honors an explicit concrete ratio
+    items = [i for i in payload["content"] if i["type"] != "text"]
+    roles = [i.get("role") for i in items]
+    assert roles == [
+        "reference_image",
+        "reference_image",
+        "reference_video",
+        "reference_video",
+        "reference_video",
+        "reference_audio",
+    ]
+    # counts capped at API limits
+    assert len([i for i in items if i.get("role") == "reference_video"]) == 3
+    assert len([i for i in items if i.get("role") == "reference_audio"]) == 1
+    assert len([i for i in items if i.get("role") == "reference_image"]) == 2
+
+
+def test_h3_payload_reference_video_cap_three():
+    """More than 3 reference videos are clamped to the API cap."""
+    from plugins.video_gen.minimax import _build_h3_payload
+
+    payload, _note, mode = _build_h3_payload(
+        prompt_text="clamp",
+        image_url=None,
+        reference_image_urls=None,
+        reference_video_urls=[
+            f"https://example.com/v{i}.mp4" for i in range(6)
+        ],
+        reference_audio_urls=None,
+        duration=None,
+        aspect_ratio=None,
+    )
+    assert mode == "reference"
+    videos = [i for i in payload["content"] if i.get("role") == "reference_video"]
+    assert len(videos) == 3
+
+
+def test_h3_payload_audio_alone_raises():
+    """Audio alone is not a valid reference mode — must pair with image/video."""
+    from plugins.video_gen.minimax import _build_h3_payload
+
+    with pytest.raises(ValueError):
+        _build_h3_payload(
+            prompt_text="audio only",
+            image_url=None,
+            reference_image_urls=None,
+            reference_video_urls=None,
+            reference_audio_urls=["https://example.com/vocals.wav"],
+            duration=None,
+            aspect_ratio=None,
+        )
+
+
+def test_h3_capabilities_include_reference_video_audio():
+    from plugins.video_gen.minimax import MinimaxVideoGenProvider
+
+    caps = MinimaxVideoGenProvider().capabilities()
+    assert caps["max_reference_videos"] == 3
+    assert caps["max_reference_audio"] == 3
+
+    v1_caps = MinimaxVideoGenProvider().capabilities(model="MiniMax-Hailuo-2.3")
+    assert v1_caps["max_reference_videos"] == 0
+    assert v1_caps["max_reference_audio"] == 0
+
+
+def test_hailuo_v1_rejects_reference_video_audio(monkeypatch):
+    """v1 has no reference video/audio roles — must fail loudly, not silently."""
+    from plugins.video_gen.minimax import MinimaxVideoGenProvider
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-key")
+    monkeypatch.setenv("MINIMAX_API_HOST", "https://api.minimax.io")
+    result = MinimaxVideoGenProvider().generate(
+        "a dog",
+        model="MiniMax-Hailuo-2.3",
+        reference_video_urls=["https://example.com/clip.mp4"],
+    )
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_params"
+    assert "MiniMax-H3" in result["error"]

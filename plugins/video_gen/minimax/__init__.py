@@ -13,10 +13,15 @@ Mode routing inside each API version is driven by which inputs are provided:
   prompt + 1 image                     → image-to-video (first frame)
   prompt + 2 images                    → image-to-video (first + last frame)
   prompt + 3+ images                   → reference-to-video (role=reference_image)
+  prompt + reference video(s)          → reference-to-video (role=reference_video)
+  prompt + reference audio(s)          → reference-to-video (role=reference_audio,
+                                        must be paired with an image or video)
 
 The agent never sees the routing — it just calls
-``video_generate(prompt=..., image_url=..., reference_image_urls=...)``.
-``image_url`` merges with ``reference_image_urls`` as the first input.
+``video_generate(prompt=..., image_url=..., reference_image_urls=...,
+reference_video_urls=..., reference_audio_urls=...)``.
+``image_url`` merges with ``reference_image_urls`` as the first input;
+any reference video/audio forces the whole request into reference mode.
 
 Authentication: ``MINIMAX_API_KEY`` env var. Set in ``~/.hermes/.env`` or
 exported directly. The API host defaults to ``https://api.minimax.io``;
@@ -76,6 +81,8 @@ H3_VALID_RATIOS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
 # Unified-surface ratios the H3 v2 API does not offer, mapped to nearest.
 H3_RATIO_MAP = {"3:2": "16:9", "2:3": "9:16"}
 H3_MAX_REFERENCE_IMAGES = 9
+H3_MAX_REFERENCE_VIDEOS = 3
+H3_MAX_REFERENCE_AUDIO = 3
 H3_MAX_TEXT_CHARS = 7000
 H3_MAX_BODY_BYTES = 60 * 1024 * 1024  # v2 hard limit is 64 MB; headroom for JSON overhead
 
@@ -165,6 +172,31 @@ def _build_image_input(value: str) -> Optional[Dict[str, str]]:
     import mimetypes
 
     mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return {"url": f"data:{mime};base64,{encoded}"}
+
+
+def _build_media_input(value: str) -> Optional[Dict[str, str]]:
+    """Return a MiniMax media input dict from a URL, data-URI or local file.
+
+    Used for reference video/audio inputs. Accepts ``https://`` URLs,
+    ``data:video/...`` / ``data:audio/...`` data URIs, and local files
+    (base64-encoded with a lowercase mime prefix, per the v2 schema).
+    """
+    ref = (value or "").strip()
+    if not ref:
+        return None
+    lower = ref.lower()
+    if lower.startswith(("http://", "https://")):
+        return {"url": ref}
+    if lower.startswith(("data:video/", "data:audio/")):
+        return {"url": ref}
+    path = Path(ref).expanduser()
+    if not path.is_file():
+        return None
+    import mimetypes
+
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return {"url": f"data:{mime};base64,{encoded}"}
 
@@ -274,6 +306,38 @@ def _is_h3_model(model: Optional[str]) -> bool:
     return normalized == H3_MODEL.lower() or normalized == "h3"
 
 
+# Markers in H3 error responses that indicate the current token plan does
+# NOT include H3 access — distinct from caller errors like missing_prompt or
+# payload_too_large. When the provider's generate() sees these, it falls
+# back to the legacy Hailuo 2.3 (v1 API) model. The user explicitly requested
+# this automatic fallback (Jul 2026) because H3 access depends on plan tier
+# and the v1 model is broadly available.
+_H3_PLAN_TIER_UNAVAILABLE_MARKERS = (
+    "does not currently support",
+    "TokenPlan",
+    "Insufficient balance",
+    "Insufficient credit",
+    "plan tier",
+    "(2013)",
+)
+
+
+def _is_h3_plan_tier_unavailable(response: Dict[str, Any]) -> bool:
+    """True when an H3 response indicates plan/credit unavailability.
+
+    Conservative: matches only ``api_error`` responses whose error string
+    contains a plan-tier marker. Caller errors (missing_prompt,
+    payload_too_large, auth_required, invalid_params) are surfaced
+    unchanged so the user still sees them.
+    """
+    if not isinstance(response, dict):
+        return False
+    if response.get("error_type") != "api_error":
+        return False
+    msg = str(response.get("error") or "")
+    return any(marker in msg for marker in _H3_PLAN_TIER_UNAVAILABLE_MARKERS)
+
+
 def _build_h3_image_item(url: str, role: str) -> Dict[str, Any]:
     """Build one ``image_url`` content item for the H3 v2 API.
 
@@ -287,44 +351,86 @@ def _build_h3_content(
     prompt_text: str,
     image_url: Optional[str],
     reference_image_urls: Optional[List[str]],
+    reference_video_urls: Optional[List[str]] = None,
+    reference_audio_urls: Optional[List[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """Build the v2 ``content`` array; return ``(content, mode)``.
 
-    Mode is ``"text"``, ``"image"`` (first/last frame) or ``"reference"``
-    (3+ reference images). ``image_url`` merges with
-    ``reference_image_urls`` as the first input. Image-to-video and
-    reference-to-video are mutually exclusive on the API, so 3+ images
-    switches the whole request to reference mode.
+    Mode is ``"text"``, ``"image"`` (first/last frame) or ``"reference"``.
+
+    Reference mode is entered when **video or audio references are
+    present** (image-to-video and reference modes are mutually exclusive
+    on the API, so any ``reference_*`` role forces ALL images into
+    ``reference_image`` roles), or when 3+ images are provided.
+    ``image_url`` merges with ``reference_image_urls`` as the first input.
+
+    Raises ``ValueError`` if audio references are given with no image or
+    video reference (audio alone is not a valid reference mode on the API).
     """
     content: List[Dict[str, Any]] = [{"type": "text", "text": prompt_text}]
 
-    candidates: List[str] = []
+    image_candidates: List[str] = []
     if image_url and image_url.strip():
-        candidates.append(image_url.strip())
+        image_candidates.append(image_url.strip())
     for ref in reference_image_urls or []:
         if ref and ref.strip():
-            candidates.append(ref.strip())
+            image_candidates.append(ref.strip())
 
-    normalized: List[str] = []  # normalized image URLs (only valid inputs)
-    for cand in candidates:
+    image_urls: List[str] = []  # normalized image URLs (only valid inputs)
+    for cand in image_candidates:
         img = _build_image_input(cand)
         if img and img.get("url"):
-            normalized.append(img["url"])
+            image_urls.append(img["url"])
 
-    if not normalized:
+    video_urls: List[str] = []
+    for ref in reference_video_urls or []:
+        if ref and ref.strip():
+            media = _build_media_input(ref)
+            if media and media.get("url"):
+                video_urls.append(media["url"])
+
+    audio_urls: List[str] = []
+    for ref in reference_audio_urls or []:
+        if ref and ref.strip():
+            media = _build_media_input(ref)
+            if media and media.get("url"):
+                audio_urls.append(media["url"])
+
+    if not image_urls and not video_urls and not audio_urls:
         return content, "text"
 
-    if len(normalized) == 1:
-        content.append(_build_h3_image_item(normalized[0], "first_frame"))
+    if audio_urls and not image_urls and not video_urls:
+        raise ValueError(
+            "reference audio requires at least one image or video reference "
+            "(audio alone is not a valid MiniMax H3 reference mode)"
+        )
+
+    if video_urls or audio_urls:
+        # Any reference video/audio → reference mode; all images become
+        # reference_image roles (i2v and reference modes are exclusive).
+        for url in image_urls[:H3_MAX_REFERENCE_IMAGES]:
+            content.append(_build_h3_image_item(url, "reference_image"))
+        for url in video_urls[:H3_MAX_REFERENCE_VIDEOS]:
+            content.append(
+                {"type": "video_url", "video_url": {"url": url}, "role": "reference_video"}
+            )
+        for url in audio_urls[:H3_MAX_REFERENCE_AUDIO]:
+            content.append(
+                {"type": "audio_url", "audio_url": {"url": url}, "role": "reference_audio"}
+            )
+        return content, "reference"
+
+    if len(image_urls) == 1:
+        content.append(_build_h3_image_item(image_urls[0], "first_frame"))
         return content, "image"
 
-    if len(normalized) == 2:
-        content.append(_build_h3_image_item(normalized[0], "first_frame"))
-        content.append(_build_h3_image_item(normalized[1], "last_frame"))
+    if len(image_urls) == 2:
+        content.append(_build_h3_image_item(image_urls[0], "first_frame"))
+        content.append(_build_h3_image_item(image_urls[1], "last_frame"))
         return content, "image"
 
     # 3+ images → reference-to-video; all images become references.
-    for url in normalized[:H3_MAX_REFERENCE_IMAGES]:
+    for url in image_urls[:H3_MAX_REFERENCE_IMAGES]:
         content.append(_build_h3_image_item(url, "reference_image"))
     return content, "reference"
 
@@ -365,13 +471,16 @@ def _build_h3_payload(
     prompt_text: str,
     image_url: Optional[str],
     reference_image_urls: Optional[List[str]],
+    reference_video_urls: Optional[List[str]] = None,
+    reference_audio_urls: Optional[List[str]] = None,
     duration: Optional[int],
     aspect_ratio: Optional[str],
 ) -> Tuple[Dict[str, Any], Optional[str], str]:
     """Build the H3 v2 request body (pure; no I/O).
 
     Returns ``(payload, ratio_note, mode)``. Raises ``ValueError`` for
-    invalid prompts (empty, over the 7000-char limit).
+    invalid prompts (empty, over the 7000-char limit) or invalid
+    reference combinations (audio without image/video reference).
     """
     if not prompt_text or not prompt_text.strip():
         raise ValueError("prompt is required for MiniMax H3 video generation.")
@@ -382,7 +491,13 @@ def _build_h3_payload(
             f"limit ({len(prompt_text)} chars). Shorten the prompt."
         )
 
-    content, mode = _build_h3_content(prompt_text, image_url, reference_image_urls)
+    content, mode = _build_h3_content(
+        prompt_text,
+        image_url,
+        reference_image_urls,
+        reference_video_urls,
+        reference_audio_urls,
+    )
 
     dur = int(duration) if duration is not None else DEFAULT_DURATION
     dur = max(H3_MIN_DURATION, min(H3_MAX_DURATION, dur))
@@ -593,6 +708,8 @@ class MinimaxVideoGenProvider(VideoGenProvider):
                 "supports_audio": False,
                 "supports_negative_prompt": False,
                 "max_reference_images": 0,
+                "max_reference_videos": 0,
+                "max_reference_audio": 0,
             }
         return {
             "modalities": ["text", "image"],
@@ -603,6 +720,8 @@ class MinimaxVideoGenProvider(VideoGenProvider):
             "supports_audio": False,
             "supports_negative_prompt": False,
             "max_reference_images": H3_MAX_REFERENCE_IMAGES,
+            "max_reference_videos": H3_MAX_REFERENCE_VIDEOS,
+            "max_reference_audio": H3_MAX_REFERENCE_AUDIO,
         }
 
     def generate(
@@ -612,6 +731,8 @@ class MinimaxVideoGenProvider(VideoGenProvider):
         model: Optional[str] = None,
         image_url: Optional[str] = None,
         reference_image_urls: Optional[List[str]] = None,
+        reference_video_urls: Optional[List[str]] = None,
+        reference_audio_urls: Optional[List[str]] = None,
         duration: Optional[int] = None,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         resolution: str = DEFAULT_RESOLUTION,
@@ -623,11 +744,13 @@ class MinimaxVideoGenProvider(VideoGenProvider):
         resolved_model = (model or "").strip() or DEFAULT_MODEL
         if _is_h3_model(resolved_model):
             # MiniMax H3 → v2 API (content array, 2K, 4-15s)
-            return _run_coroutine(
+            h3_result = _run_coroutine(
                 _generate_h3_video_async(
                     prompt=prompt,
                     image_url=image_url,
                     reference_image_urls=reference_image_urls,
+                    reference_video_urls=reference_video_urls,
+                    reference_audio_urls=reference_audio_urls,
                     duration=duration,
                     aspect_ratio=aspect_ratio,
                     resolution=resolution,
@@ -638,6 +761,47 @@ class MinimaxVideoGenProvider(VideoGenProvider):
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
             )
+            # Automatic fallback: when H3 is unavailable on the current
+            # token plan (e.g. error 2013 "TokenPlan or Credit does not
+            # currently support MiniMax-H3 series models"), fall through to
+            # the legacy Hailuo 2.3 (v1 API) model. Triggered only for
+            # plan-tier errors — caller errors (missing_prompt,
+            # payload_too_large, auth_required, invalid_params) are
+            # surfaced unchanged.
+            #
+            # Note: Hailuo 2.3 only supports 6s/10s durations and 768P/1080P;
+            # requested duration < 6 or > 10 will be clamped to 6s, and the
+            # 720p resolution will be replaced. Reference video/audio
+            # inputs are rejected by the v1 API (it will return its own
+            # clear error rather than silently dropping them).
+            if _is_h3_plan_tier_unavailable(h3_result):
+                logger.warning(
+                    "MiniMax H3 unavailable on current plan (error_type=%s); "
+                    "falling back to %s. Requested duration=%s will be "
+                    "clamped to 6s by the v1 API if outside {{6,10}}.",
+                    h3_result.get("error_type"),
+                    LEGACY_MODEL,
+                    duration,
+                )
+                return _run_coroutine(
+                    _generate_minimax_video_async(
+                        prompt=prompt,
+                        model=LEGACY_MODEL,
+                        image_url=image_url,
+                        reference_image_urls=reference_image_urls,
+                        reference_video_urls=reference_video_urls,
+                        reference_audio_urls=reference_audio_urls,
+                        duration=duration,
+                        aspect_ratio=aspect_ratio,
+                        resolution=resolution,
+                        seed=seed,
+                    ),
+                    operation_label="generation (Hailuo 2.3 fallback)",
+                    model=LEGACY_MODEL,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                )
+            return h3_result
         # MiniMax Hailuo 2.3 / other v1 models → legacy v1 API
         return _run_coroutine(
             _generate_minimax_video_async(
@@ -645,6 +809,8 @@ class MinimaxVideoGenProvider(VideoGenProvider):
                 model=resolved_model,
                 image_url=image_url,
                 reference_image_urls=reference_image_urls,
+                reference_video_urls=reference_video_urls,
+                reference_audio_urls=reference_audio_urls,
                 duration=duration,
                 aspect_ratio=aspect_ratio,
                 resolution=resolution,
@@ -668,6 +834,8 @@ async def _generate_minimax_video_async(
     model: Optional[str],
     image_url: Optional[str],
     reference_image_urls: Optional[List[str]],
+    reference_video_urls: Optional[List[str]] = None,
+    reference_audio_urls: Optional[List[str]] = None,
     duration: Optional[int],
     aspect_ratio: str,
     resolution: str,
@@ -695,6 +863,21 @@ async def _generate_minimax_video_async(
             provider="minimax",
             model=model or LEGACY_MODEL,
             prompt="",
+        )
+
+    # v1 (Hailuo) has no reference video/audio roles — fail loudly rather
+    # than silently dropping the caller's references.
+    if reference_video_urls or reference_audio_urls:
+        return error_response(
+            error=(
+                "reference video/audio are not supported by "
+                "MiniMax-Hailuo-2.3 (v1 API). Use the MiniMax-H3 model "
+                "for reference-to-video with video/audio inputs."
+            ),
+            error_type="invalid_params",
+            provider="minimax",
+            model=model or LEGACY_MODEL,
+            prompt=prompt_text,
         )
 
     # Clamp duration to MiniMax's valid set
@@ -925,6 +1108,8 @@ async def _generate_h3_video_async(
     prompt: str,
     image_url: Optional[str],
     reference_image_urls: Optional[List[str]],
+    reference_video_urls: Optional[List[str]] = None,
+    reference_audio_urls: Optional[List[str]] = None,
     duration: Optional[int],
     aspect_ratio: str,
     resolution: str,
@@ -959,6 +1144,8 @@ async def _generate_h3_video_async(
             prompt_text=prompt_text,
             image_url=image_url,
             reference_image_urls=reference_image_urls,
+            reference_video_urls=reference_video_urls,
+            reference_audio_urls=reference_audio_urls,
             duration=duration,
             aspect_ratio=aspect_ratio,
         )
