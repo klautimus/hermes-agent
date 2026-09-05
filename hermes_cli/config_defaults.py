@@ -743,6 +743,12 @@ DEFAULT_CONFIG = {
         # (moa.presets.<name>.reference_models[].reasoning_effort / aggregator.reasoning_effort).
         "moa_reference": _aux(900, reasoning_effort=False),
         "moa_aggregator": _aux(900, reasoning_effort=False),
+        # Advisor — on-demand consultation with a secondary (strategic) model via the
+        # ``advisor`` toolset (opt-in; `hermes tools enable advisor`). Executor provides
+        # context; the advisor does the thinking and returns a plan. Timeout is generous —
+        # the advisor frequently reasons for minutes on architecture/design briefs.
+        # visible_advice: when true the user sees the advisor's guidance in chat; false hides it.
+        "advisor": {**_aux(1800, reasoning_effort=False), "visible_advice": True},
     },
 
     "display": {
