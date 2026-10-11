@@ -1,0 +1,29 @@
+# Runtime dependencies for the trafilatura web-extract backend plugin.
+#
+# Why this file exists: Hermes v0.21.6 runs on a PM-managed Python environment
+# (`hermes pm install`), not the legacy uv venv. PM composes core + extras +
+# enabled plugins' declared dependencies into that environment. Upstream's
+# bundled web backends declare theirs as core extras in the root pyproject
+# (e.g. `ddgs = ["ddgs==9.16.0"]`); trafilatura is a local custom commit that
+# upstream does not ship, so nothing declared it and the package was absent
+# from every PM environment — making the provider report is_available()=False
+# and web_extract silently fall back to another backend.
+#
+# The plugin docs prefer a pyproject.toml next to plugin.yaml, and it takes
+# precedence over `python_dependencies` in plugin.yaml. Keeping the declaration
+# here (rather than in the root pyproject) keeps this custom change confined to
+# this plugin directory, so it survives fork-and-rebase updates with no core
+# file conflicts.
+#
+# Upper bounds are required by the plugin dev tooling (plugin_dev.py warns when
+# a requirement has no upper bound).
+
+[project]
+name = "hermes-plugin-web-trafilatura"
+version = "1.0.0"
+description = "Trafilatura web content extraction backend for Hermes Agent"
+requires-python = ">=3.11"
+dependencies = [
+    "trafilatura>=2.2,<3",
+    "brotli>=1.1,<2",
+]

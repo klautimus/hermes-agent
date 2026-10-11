@@ -233,6 +233,12 @@ exa = ["exa-py==2.10.2"]
 firecrawl = ["firecrawl-py==4.17.0"]
 parallel-web = ["parallel-web==0.4.2"]
 ddgs = ["ddgs==9.16.0"]
+# Trafilatura web-extract backend. This plugin is a LOCAL CUSTOM COMMIT (upstream
+# does not ship it), so unlike ddgs/exa/firecrawl it has no upstream plugin
+# workspace declaring its dependency — the extra is declared here so
+# `hermes pm install --extra trafilatura` puts the package in the PM-managed
+# environment that actually runs Hermes.
+trafilatura = ["trafilatura==2.2.0"]
 # Image generation backends
 fal = ["fal-client==0.13.1"]
 # Edge TTS — default TTS provider but still optional (users can pick

@@ -23,6 +23,7 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     "firecrawl": "firecrawl",
     "parallel-web": "parallel",
     "ddgs": "ddgs",
+    "trafilatura": "trafilatura",
     "otlp": "opentelemetry.sdk",
     "langfuse": "langfuse",
     "mistral": "mistralai",
