@@ -3,6 +3,15 @@
 tool result already carries the content verbatim. Cleared via ``reset_skill_view_dedup()`` on
 context compression AND on a committed proactive tool-result prune, because both replace the
 original content with a one-line marker.
+
+DEDUP IS ONLY SOUND WHILE THE EARLIER RESULT STILL CARRIES THE CONTENT. The reset calls cover
+the boundaries we know about; they cannot cover every path that reduces a tool result to a
+marker. A stub is therefore only served for bodies the compressor keeps VERBATIM — see
+``_prune_destroyable_floor`` below. For a body at or above that floor the stub is a lockout:
+it tells the model the earlier result "is still current and complete" when that result is a
+``[SKILL_PRUNED: ...]`` marker asking for exactly the reload the stub refuses, so the skill's
+instructions are unrecoverable for the rest of the session while the model believes it holds
+them.
 """
 
 import json
@@ -15,10 +24,11 @@ _skill_view_tracker_lock = threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
 
 _SKILL_VIEW_DEDUP_MESSAGE = (
-    "Skill content unchanged since it was loaded earlier in this "
-    "conversation — refer to the earlier skill_view result; it is still "
-    "current and complete. (Re-issued after context compression, this "
-    "returns the full content again.)")
+    "Skill content unchanged since it was loaded earlier in this conversation. "
+    "The earlier skill_view result still carries the full body — use it. "
+    "If that earlier result is now a [SKILL_PRUNED: ...] marker or a one-line "
+    "summary, the body is gone and you must re-read it: call "
+    "skill_view(name='<skill>', file_path='SKILL.md') to bypass this stub.")
 
 
 def _skill_view_fingerprint(payload: dict) -> tuple | None:
@@ -32,6 +42,27 @@ def _skill_view_fingerprint(payload: dict) -> tuple | None:
         return None
 
 
+def _prune_destroyable_floor() -> int:
+    """The compressor's skill-body prune floor, resolved at call time so the two constants
+    cannot drift. ImportError (not a wide except) falls back to the safe direction: treat the
+    body as destroyable, i.e. do NOT dedup it."""
+    try:
+        from agent.context_compressor import _SKILL_VIEW_PRUNE_MIN_CHARS
+        return int(_SKILL_VIEW_PRUNE_MIN_CHARS)
+    except ImportError:
+        return 0
+
+
+def _is_prune_destroyable(payload: dict) -> bool:
+    """True when the served body is large enough that compaction may reduce it to a
+    ``[SKILL_PRUNED: ...]`` marker — in which case a dedup stub would lock the model out of
+    the reload that marker asks for, so the body must always be re-served."""
+    content = payload.get("content")
+    if not isinstance(content, str):
+        return False  # no body served (e.g. a file listing): nothing to lose, dedup is safe
+    return len(content) >= _prune_destroyable_floor()
+
+
 def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
     """Record a served skill_view so an identical repeat can be deduped."""
     # Never dedup setup-needed views: readiness depends on config/env state that
@@ -40,6 +71,8 @@ def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
             or payload.get("readiness_status") == "setup_needed"):
         return
     if (fp := _skill_view_fingerprint(payload)) is None:
+        return
+    if _is_prune_destroyable(payload):
         return
     key = (str(payload.get("name") or name), file_path or "")
     with _skill_view_tracker_lock:
