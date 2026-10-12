@@ -436,6 +436,21 @@ ASYNC_HANDOFF_GUIDANCE = (
     "completion before it is delivered."
 )
 
+# LOCAL (klautimus/hermes-agent). Upstream ships only the block above, which frames a background
+# delegate_task dispatch as a turn-ending event. On a top-level session (delegation depth 0, where
+# dispatch is always asynchronous) that makes the agent yield after EVERY batch and wait to be prodded,
+# which starves multi-phase plans. agent.async_handoff_guidance: false selects this variant instead:
+# the yield is narrowed to the real dependency boundary rather than removed, so the between-turn
+# delivery contract still gets its boundary and independent work keeps flowing.
+ASYNC_HANDOFF_GUIDANCE_SCOPED = (
+    "# Async delegation handoff\n"
+    "Background delegate_task results re-enter the conversation only at a turn boundary. A turn boundary is a "
+    "delivery handoff, not task completion. Continue every step that does not depend on the pending children — "
+    "dispatching does not end your turn. End the turn only when your next required step needs a pending result. "
+    "When a result arrives as a new message, resume the original plan immediately: do not stop to acknowledge it, "
+    "and do not ask whether to continue. Never poll transcripts, artifact files, or CI."
+)
+
 # Universal parallel-tool-call guidance (ALL models): the runtime already executes independent calls
 # concurrently. Supersedes the former Google-only bullet so no model receives the steer twice.
 # Why this matters for cost: every assistant turn resends the entire accumulated conversation (and, on

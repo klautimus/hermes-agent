@@ -611,12 +611,16 @@ def _build_top_level_description(*, independent_completions=None) -> str:
         "each ungrouped task / `group` returns on its own"
         if independent_completions else "one message per call"
     )
-    return _DESCRIPTION_HEAD.format(delivery=delivery) + restrictions_rule + _DESCRIPTION_TAIL
+    from tools.delegate_tool_config import _get_async_handoff_guidance
+    head = _DESCRIPTION_HEAD if _get_async_handoff_guidance() else _DESCRIPTION_HEAD_CONTINUE
+    return head.format(delivery=delivery) + restrictions_rule + _DESCRIPTION_TAIL
 
-_DESCRIPTION_HEAD = (
+_DESCRIPTION_HEAD_INTRO = (
     "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its "
     "final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel "
     "(limit in the tasks description).\n\n"
+)
+_DESCRIPTION_HEAD_DELIVERY_UPSTREAM = (
     "Sessions without a later-result consumer (including one-shot CLI and cron) join parallel children "
     "and return results in this tool call. "
     "Otherwise runs in the background: dispatch returns live transcript paths and results re-enter "
@@ -624,6 +628,16 @@ _DESCRIPTION_HEAD = (
     "BETWEEN your turns: finish whatever does not depend on them, then give a one-line status and END YOUR TURN. Never "
     "wait or poll on transcripts, artifact files, or CI for a child. "
     "While children run, `action` (list/steer/stop) controls them live.\n\n"
+)
+_DESCRIPTION_HEAD_DELIVERY_CONTINUE = (
+    "Sessions without a later-result consumer (including one-shot CLI and cron) join parallel children "
+    "and return results in this tool call. Otherwise it runs in the background: dispatch returns live "
+    "transcript paths and results re-enter as a new message when subagents finish ({delivery}). Dispatching "
+    "does NOT end your turn — keep working on anything that does not depend on the pending children, and end "
+    "the turn only when your next required step needs their results. Never wait or poll on transcripts, "
+    "artifact files, or CI for a child. While children run, `action` (list/steer/stop) controls them live.\n\n"
+)
+_DESCRIPTION_HEAD_OUTRO = (
     "USE FOR: reasoning-heavy subtasks, work that would flood your context, or independent parallel workstreams.\n"
     "DO NOT USE FOR (use these instead):\n"
     "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
@@ -641,6 +655,13 @@ _DESCRIPTION_HEAD = (
     "- Children cannot close tracked work: a child asked to close it returns findings instead; "
     "the parent applies the transition.\n"
 )
+
+# agent.async_handoff_guidance selects which head _build_top_level_description() renders.
+_DESCRIPTION_HEAD = _DESCRIPTION_HEAD_INTRO + _DESCRIPTION_HEAD_DELIVERY_UPSTREAM + _DESCRIPTION_HEAD_OUTRO
+_DESCRIPTION_HEAD_CONTINUE = (
+    _DESCRIPTION_HEAD_INTRO + _DESCRIPTION_HEAD_DELIVERY_CONTINUE + _DESCRIPTION_HEAD_OUTRO
+)
+
 _DESCRIPTION_TAIL = (
     "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
 )

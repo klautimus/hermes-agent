@@ -19,7 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.delegation_context import owned_kanban_task
 from agent.prompt_builder import (
-    ADVISOR_GUIDANCE, ASYNC_HANDOFF_GUIDANCE, DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    ADVISOR_GUIDANCE, ASYNC_HANDOFF_GUIDANCE, ASYNC_HANDOFF_GUIDANCE_SCOPED, DEFAULT_AGENT_IDENTITY,
+    EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
@@ -580,7 +581,12 @@ def _guidance_parts(agent: Any) -> List[str]:
     # delegate_task background delivery is intentionally between turns. Put this after the generic persistence
     # blocks so their "keep working" rule cannot turn the required yield into no-op/polling activity.
     if "delegate_task" in agent.valid_tool_names:
-        parts.append(ASYNC_HANDOFF_GUIDANCE)
+        # LOCAL: agent.async_handoff_guidance (default True = upstream yield-after-dispatch). False = the
+        # dependency-boundary variant. See ASYNC_HANDOFF_GUIDANCE_SCOPED in agent/prompt_builder.py.
+        parts.append(
+            ASYNC_HANDOFF_GUIDANCE if getattr(agent, "_async_handoff_guidance", True)
+            else ASYNC_HANDOFF_GUIDANCE_SCOPED
+        )
     return parts
 
 

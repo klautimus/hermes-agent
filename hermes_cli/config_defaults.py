@@ -192,6 +192,14 @@ DEFAULT_CONFIG = {
         "environment_probe": True,
         # Bot Mode teammate-messaging protocol section (silent unless desktop Bot Mode manages it).
         "bot_mode_protocol": True,
+        # Async-delegation handoff framing. True (upstream) = a background delegate_task dispatch is framed
+        # as a turn-ending event ("END YOUR TURN"), which matches the between-turn delivery contract but
+        # makes a top-level agent yield after every batch. False = dependency-boundary wording: dispatching
+        # does not end the turn; keep working on anything that does not depend on the pending children and
+        # yield only when the next required step needs their results. Governs three surfaces: the
+        # ASYNC_HANDOFF_GUIDANCE prompt block, the delegate_task tool description, and the dispatch-handle
+        # note. Takes effect on a new session (gateway: /restart).
+        "async_handoff_guidance": True,
         # Embedder-supplied text appended to the system prompt's environment-hints block, so a host
         # wrapping Hermes (sandbox runner, managed platform) can describe proxy/credential/ mount
         # layout without editing SOUL.md. Env HERMES_ENVIRONMENT_HINT overrides it.

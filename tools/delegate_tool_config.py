@@ -112,6 +112,29 @@ def _get_independent_completions() -> bool:
     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""
     return is_truthy_value(_cfg().get("independent_completions", False))
 
+def _get_async_handoff_guidance() -> bool:
+    """agent.async_handoff_guidance (bool, default True).
+
+    True (upstream) = the delegate_task tool description and the dispatch-handle note both frame a background
+    dispatch as a turn-ending event ("END YOUR TURN ... stop with a one-line status"). Correct for the
+    between-turn delivery contract, but on a top-level session (depth 0, where dispatch is always async) it
+    makes the agent yield after every batch and wait to be prodded.
+
+    False = dependency-boundary wording: dispatching does not end the turn; keep working on anything that does
+    not depend on the pending children, and yield only when the next required step needs their results.
+
+    Reads the ``agent`` section (not ``delegation``) because this is a prompt/tool-text gate, matching how
+    agent.task_completion_guidance and agent.parallel_tool_call_guidance are declared. Never mutates the
+    cached config — load_config_readonly() hands back the in-process object.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        agent_section = (load_config_readonly() or {}).get("agent") or {}
+    except Exception:
+        return True
+    return is_truthy_value(agent_section.get("async_handoff_guidance"), default=True)
+
+
 def _get_worktree_isolation() -> bool:
     """delegation.worktree_isolation (bool, default False): each child gets its own
     git worktree off the parent's HEAD so parallel children never contend for one

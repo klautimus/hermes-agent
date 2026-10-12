@@ -333,6 +333,18 @@ _BACKGROUND_NOTES = {
         "after you END YOUR TURN: do anything that does not depend on them, then stop with a one-line status. Do not "
         "poll transcripts or artifacts to wait for them."
     ),
+    "one_continue": (
+        "Subagent is running in the background; its full result re-enters the conversation as a new message when it "
+        "finishes. Dispatching does NOT end your turn: keep working on anything that does not depend on it, and end "
+        "the turn only when your next required step needs its result. Do not poll its transcript or artifacts to "
+        "wait for it."
+    ),
+    "many_continue": (
+        "{n} subagents are running in parallel in the background as {k} completion unit(s); each unit's results "
+        "re-enter the conversation as their own new message when THAT unit finishes. Dispatching does NOT end your "
+        "turn: keep working on anything that does not depend on them, and end the turn only when your next required "
+        "step needs their results. Do not poll transcripts or artifacts to wait for them."
+    ),
     "control_hint": (
         "While a child runs you can orchestrate it live with this same tool: delegate_task(action='list') to see live "
         "children, action='steer' with subagent_id + message to redirect one, action='stop' with subagent_id to end "
@@ -344,6 +356,18 @@ _BACKGROUND_NOTES = {
     ),
 }
 
+def _dispatch_note(n: int, k: int) -> str:
+    """Model-facing note for an accepted background dispatch.
+
+    agent.async_handoff_guidance (default True) renders the upstream wording, which makes the dispatch itself a
+    turn-ending event. False renders the dependency-boundary wording. See _get_async_handoff_guidance().
+    """
+    from tools.delegate_tool_config import _get_async_handoff_guidance
+    if _get_async_handoff_guidance():
+        return _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(n=n, k=k)
+    return _BACKGROUND_NOTES["one_continue"] if n == 1 else _BACKGROUND_NOTES["many_continue"].format(n=n, k=k)
+
+
 def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
     """Model-facing handle for an accepted background call: one entry per async unit."""
     goals = [t["goal"] for t in batch.task_list]
@@ -351,7 +375,7 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
     payload = {
         "status": "dispatched", "mode": "background", "count": n,
         "delegation_id": batch.live_deleg_id or units[0][1], "goals": goals,
-        "note": _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(n=n, k=len(units)),
+        "note": _dispatch_note(n, len(units)),
     }
     if len(units) > 1:
         payload["units"] = [
