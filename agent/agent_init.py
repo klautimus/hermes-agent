@@ -302,6 +302,43 @@ def _custom_provider_extra_body_for_agent(
     return fallback
 
 
+def _apply_config_max_tokens(agent, model_section: Dict[str, Any], context_length: Optional[int]) -> None:
+    """LOCAL (klautimus/hermes-agent): honour ``model.max_tokens`` as the main model's output cap.
+
+    Hermes sends no ``max_tokens`` unless the AIAgent constructor receives one, so the provider's
+    request-level default applies. Where that default sits far below the model's advertised cap
+    (api.deepseek.com advertises ``max_output_tokens=393216`` for ``deepseek-flash`` yet truncates
+    long completions), a big ``write_file`` / ``patch`` call returns ``finish_reason='length'`` with
+    incomplete tool-call JSON, Hermes refuses the partial call, and the turn dies with "raise
+    max_tokens for this model" — advice that had no configuration path before this key.
+
+    Unset/None/""/non-positive leaves upstream behaviour untouched (field omitted).
+    Clamped to the resolved context length so it can never exceed the window.
+    """
+    if getattr(agent, "max_tokens", None) is not None:
+        return  # an explicit runtime/constructor max_tokens wins
+    raw = cfg_get(model_section, "max_tokens", default=None)
+    if raw is None or raw == "":
+        return
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "model.max_tokens in config.yaml must be a plain integer (e.g. 393216, not '384K'); "
+            "got %r — ignoring, so the provider default applies.", raw,
+        )
+        return
+    if value <= 0:
+        return
+    if isinstance(context_length, int) and 0 < context_length < value:
+        logger.warning(
+            "model.max_tokens (%d) exceeds the resolved context length (%d); clamping to the window.",
+            value, context_length,
+        )
+        value = context_length
+    agent.max_tokens = value
+
+
 def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
     extra_body = _custom_provider_extra_body_for_agent(
         provider=agent.provider, model=agent.model, base_url=agent.base_url,
@@ -1877,6 +1914,11 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
 
     # Persisted for switch_model / fallback AFTER the custom_providers branch (per-model overrides).
     agent._config_context_length = _config_context_length
+
+    # LOCAL (klautimus/hermes-agent): an explicit output cap for the main model. Must run after the
+    # context length is final (for the clamp) and before the compressor is constructed, since
+    # _compressor_max_tokens() derives the compaction trigger as pct*(context_length - max_tokens).
+    _apply_config_max_tokens(agent, _model_section, _config_context_length)
     if _config_context_length is not None:
         from agent.context_pin import warn_once_on_pin_disagreement
         warn_once_on_pin_disagreement(agent.model, agent.base_url or "", _config_context_length)
