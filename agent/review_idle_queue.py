@@ -209,3 +209,11 @@ def _managed_server_idle() -> bool:
 
 # Module singleton — one queue per process, like the load-progress watcher.
 QUEUE = ReviewIdleQueue()
+
+
+def queue_key(agent: Any) -> str:
+    """Coalescing key for *agent*: one pending review per session (``id`` fallback for session-less
+    callers). This is the single source of truth for the key every enqueue path uses —
+    ``run_agent._review_queue_key`` delegates here — so the automatic-review deferral and the
+    lease hand-off share one slot per session."""
+    return str(getattr(agent, "session_id", None) or id(agent))

@@ -34,6 +34,10 @@ class _BackgroundReviewRun:
         self._lock = threading.Lock()
         self._review_agent = None
         self._request_finished = self._cancel_dispatched = False
+        # Set by the spawner (``AIAgent._spawn_background_review_now``): the exact kwargs a fork
+        # handed off by ``defer_review_for_same_process_lease`` must re-queue. None means there is
+        # nothing to re-queue, so such a review is skipped instead of entering the durable wait.
+        self.requeue_kwargs: Optional[Dict[str, Any]] = None
 
     def begin_request(self, review_agent: Any) -> bool:
         """Atomically admit the first provider-capable review phase."""
@@ -165,6 +169,77 @@ def cancel_background_review_for_live_turn(
             _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS,
             message,
         )
+
+
+def _same_process_holds_review_turn_lease(agent: Any) -> bool:
+    """True when THIS process already holds the review's conversation turn lease.
+
+    The fork shares the parent's ``session_id`` and its compression lineage, so the row
+    ``same_process_holds_session_turn_lease`` reads is the very one the fork's own admission
+    would contend on (``agent.turn_facade_lease.admit_durable_turn_lease``).
+    """
+    from agent.turn_facade_lease import same_process_holds_session_turn_lease
+
+    return same_process_holds_session_turn_lease(
+        getattr(agent, "_session_db", None), str(getattr(agent, "session_id", None) or "")
+    )
+
+
+def defer_review_for_same_process_lease(
+    agent: Any, review_run: Optional[_BackgroundReviewRun],
+) -> bool:
+    """Hand a review fork off instead of letting it wait on OUR OWN live turn's turn lease.
+
+    A background review replays the conversation through a FULL ``run_conversation``, so it takes
+    the same durable cross-process turn lease a live turn takes. When THIS process already holds
+    that lease, ``acquire_session_turn_lease`` could only be waiting for a turn that only this
+    process can end: the wait blocks the fork for up to ``LEASE_WAIT_SECONDS`` (1800s) and —
+    because the first contended attempt notifies immediately — emits "⏳ Another Hermes process is
+    using this session…" / "Still waiting for the other Hermes process on this session (Ns)…"
+    into the user's chat. Reviews are best-effort and cancellable by design, so this returns True
+    (the caller must NOT run the review and must NOT enter the durable wait) after either:
+
+    * re-queueing the review on the idle queue (``agent/review_idle_queue`` QUEUE) — coalesced per
+      session, newest snapshot wins — so it runs once the session is free; or
+    * SKIPPING it, when there is nothing to re-queue (no payload), the re-enqueue raises, or the
+      bounded requeue cap is spent. The durable wait is never a fallback for either case.
+
+    False — run the review exactly as before — for a free session, a FOREIGN holder, an
+    unreadable/unstamped lease row, and any agent without the durable-lease reader: every case
+    this function cannot prove is ours keeps today's behaviour (the immediate fork / the
+    cross-process wait). It never touches, delays or reorders the live turn.
+    """
+    if not _same_process_holds_review_turn_lease(agent):
+        return False
+    # The spawner's payload for this exact review; absent for direct/legacy callers.
+    kwargs = dict(getattr(review_run, "requeue_kwargs", None) or {})
+    session_tag = str(getattr(agent, "session_id", None) or "")[-12:]
+    if kwargs:
+        # Bounded like the preempted-review requeue: a lease row this process never releases must
+        # not cycle the review through the queue forever.
+        attempts = int(kwargs.get("_requeue_attempts", 0) or 0)
+        if attempts <= int(getattr(agent, "_REVIEW_REQUEUE_MAX_ATTEMPTS", 3) or 0):
+            try:
+                from agent.review_idle_queue import QUEUE, queue_key
+
+                QUEUE.enqueue(agent, queue_key(agent), kwargs)
+                logger.info(
+                    "Background review re-queued: this process holds the session's turn lease "
+                    "(session=%s, requeue=%d)", session_tag, attempts)
+                return True
+            except Exception:  # noqa: BLE001 — a queue failure must not become a lease wait
+                logger.warning(
+                    "Background review re-queue failed; skipping this review instead of waiting on "
+                    "our own live turn (session=%s)", session_tag, exc_info=True)
+                return True
+        logger.info(
+            "Background review dropped after %d requeues: this process still holds the session's "
+            "turn lease (session=%s)", attempts - 1, session_tag)
+        return True
+    logger.info(
+        "Background review skipped: this process holds the session's turn lease and the review "
+        "carries no re-queue payload (session=%s)", session_tag)
+    return True
 
 
 # Aux-model routing: by default ("auto") the fork runs on the MAIN model and replays the full
@@ -1126,6 +1201,9 @@ class _ReviewForkState:
     review_agent: Any = None
     review_messages: List[Dict] = field(default_factory=list)
     review_usage: Dict[str, Any] = field(default_factory=dict)
+    # The fork never ran: handed to the idle queue (or dropped) by the own-live-turn guard, so
+    # there is no usage, no action summary and no completion to publish for this attempt.
+    skipped_for_same_process_lease: bool = False
 
 
 def _release_fork_clients(review_agent: Any) -> None:
@@ -1172,6 +1250,14 @@ def _run_review_fork(
 
         _reset_background_review_read_marks()
     try:
+        # Own-live-turn guard — the LAST thing before the provider phase. A review fork whose
+        # conversation is already leased by THIS process would enter the durable cross-process
+        # wait on a turn only this process can end, notifying the user about it. Placed after the
+        # fork build so the answer is as close as possible to the acquisition it replaces; the
+        # finally below still tears the fork down, and nothing is published for a skipped attempt.
+        if defer_review_for_same_process_lease(agent, review_run):
+            st.skipped_for_same_process_lease = True
+            return
         if review_run is None or review_run.begin_request(st.review_agent):
             # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
             st.review_agent.run_conversation(
@@ -1246,6 +1332,12 @@ def _run_review_in_thread(
         # to devnull and leaves all other threads on the real streams.
         with thread_scoped_silence():
             _run_review_fork(agent, messages_snapshot, prompt, task_cfg, review_run, st, review_memory, explicit)
+        if st.skipped_for_same_process_lease:
+            # The review never entered its request phase here: it was re-queued for the idle queue
+            # (or dropped) because this process holds the session's turn lease. Nothing to
+            # summarize and nothing to publish — the re-queued copy reports its own run exactly
+            # once. The finally below still tears the fork down.
+            return
         # A buggy/legacy tool response shape must NOT take down the whole review (the outer
         # except would discard every action the fork DID complete), so coerce to an empty list.
         try:

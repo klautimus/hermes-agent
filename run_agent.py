@@ -176,7 +176,10 @@ def _review_should_defer(agent: Any, task_cfg: Optional[Dict[str, Any]]) -> bool
 
 
 def _review_queue_key(agent: Any) -> str:
-    return str(getattr(agent, "session_id", None) or id(agent))
+    """Coalescing key for the review idle queue (see ``agent.review_idle_queue.queue_key``)."""
+    from agent.review_idle_queue import queue_key
+
+    return queue_key(agent)
 
 
 def _notify_context_engine_session_end(agent: Any, messages: Optional[list]) -> None:
@@ -801,6 +804,13 @@ class AIAgent(
         review_run = prepare_background_review_run(self)
         if review_run is None:
             return
+        # Payload a fork handed off by the own-live-turn lease guard (agent.background_review
+        # .defer_review_for_same_process_lease) re-queues: an exact copy of this spawn, one step
+        # older, so the bounded requeue cap survives the trip through the idle queue.
+        review_run.requeue_kwargs = dict(
+            messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
+            focus=focus, task_cfg=task_cfg, explicit=explicit, _requeue_attempts=_requeue_attempts + 1,
+        )
         try:
             target, _prompt = spawn_background_review_thread(
                 self, messages_snapshot, review_memory=review_memory, review_skills=review_skills,
