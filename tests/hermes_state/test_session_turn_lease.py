@@ -72,6 +72,36 @@ def test_turn_lease_is_scoped_to_conversation_root(tmp_path):
     db.release_session_turn_lease("child", root_holder)
 
 
+def test_turn_lease_holder_reader_answers_for_the_lineage_row(tmp_path):
+    """Read-only holder twin: the compression descendant answers with the row admission contends on,
+    and the same-process test uses production's holder format (pid + pidns stamp)."""
+    from agent.turn_facade_lease import same_process_holds_session_turn_lease
+    from hermes_state_pidns import holder_namespace_token
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("root", source="test")
+    db.end_session("root", "compression")
+    db.create_session("child", source="test", parent_session_id="root")
+    holder = f"pid={os.getpid()}{holder_namespace_token()}:turn=root:platform=test"
+
+    assert db.session_turn_lease_holder("root") is None
+    assert db.session_turn_lease_holder("child") is None
+    assert db.try_acquire_session_turn_lease("root", holder, ttl_seconds=5)
+    # Same row from either id: the key is the conversation root.
+    assert db.session_turn_lease_holder("root") == holder
+    assert db.session_turn_lease_holder("child") == holder
+    assert same_process_holds_session_turn_lease(db, "child") is True
+    db.release_session_turn_lease("root", holder)
+    assert db.session_turn_lease_holder("child") is None
+
+    # A foreign process' row (its pid is not ours) is never read as this process' live turn.
+    foreign = f"pid={os.getpid() + 4242}{holder_namespace_token()}:turn=other:platform=test"
+    assert db.try_acquire_session_turn_lease("root", foreign, ttl_seconds=5)
+    assert db.session_turn_lease_holder("child") == foreign
+    assert same_process_holds_session_turn_lease(db, "child") is False
+    db.release_session_turn_lease("root", foreign)
+
+
 def test_turn_lease_does_not_serialize_delegate_child_with_parent(tmp_path):
     """Only compression continuation segments share a conversation lease."""
     db = SessionDB(tmp_path / "state.db")
