@@ -2176,16 +2176,19 @@ class GatewayTurnMixin:
         if not same_process_holds_session_turn_lease(db, session_id):
             return False
         adapter = self._delivery_adapter_for(event.source)
-        if adapter is None or not hasattr(adapter, "_pending_messages"):
+        slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if not isinstance(slot, dict):
             # No in-process queue to hand this event to: keep the durable path rather than drop it.
             return False
         self._queue_or_replace_pending_event(session_key, event)
-        # Verify the event really landed: at the queue cap the helper logs and returns without
-        # storing it, and a silent drop is worse than the wait this replaces.
-        if not (
-            adapter._pending_messages.get(session_key) is event
-            or event in (self._overflow_queue(session_key) or ())
-        ):
+        # Verify the event really landed (identity, not equality): at the queue cap the helper logs
+        # and returns without storing it, and a silent drop is worse than the wait this replaces.
+        if slot.get(session_key) is event:
+            queued = True
+        else:
+            overflow = self._overflow_queue(session_key) or ()
+            queued = isinstance(overflow, (list, tuple)) and any(queued_event is event for queued_event in overflow)
+        if not queued:
             return False
         logger.info(
             "Queued automatic turn for session %s in-process: a live turn in this process holds the "
