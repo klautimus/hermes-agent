@@ -657,6 +657,23 @@ class SessionCompressionMixin:
                 last_notice_at = now
             time.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
 
+    def session_turn_lease_holder(self, session_id: str) -> Optional[str]:
+        """Current holder of the conversation's turn lease, or None when the row is free.
+
+        Read-only twin of :meth:`session_turn_lease_expires_at` (same lineage key, so a
+        compression descendant answers with the row its own admission would contend on). A caller
+        that owns the row's holder identity can decide this process' own live turn is the blocker
+        BEFORE entering the cross-process wait.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
+                (self._session_turn_lease_key_on_conn(conn, session_id),),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
+
     def session_turn_lease_expires_at(self, session_id: str, holder: str) -> Optional[float]:
         """Committed ``expires_at`` of ``holder``'s turn lease, or None when it does not hold it."""
         if not session_id or not holder:

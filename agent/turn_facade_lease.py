@@ -9,6 +9,7 @@ bodies run on per-handle workers), not per-turn threads.
 """
 import logging
 import os
+import re
 import threading
 import time
 from contextlib import nullcontext
@@ -292,6 +293,59 @@ def _durable_session_exists(db, session_id: str) -> Optional[bool]:
             exc_info=True,
         )
         return None
+
+
+# ``pid=`` token inside a structured holder string (``pid=630:pidns=4026532214:turn=…``).
+_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
+
+
+def holder_process_pid(holder: str) -> Optional[int]:
+    """The ``pid=`` of a structured holder string, or None when it carries none."""
+    match = _HOLDER_PID_RE.search(holder or "")
+    return int(match.group(1)) if match else None
+
+
+def holder_is_this_process(holder: str) -> bool:
+    """True when *holder* names THIS process instance (same pid AND same PID namespace).
+
+    The namespace stamp decides first: a holder recorded in another namespace
+    (``pid=630:pidns=4026532214:…``) may legally carry our pid number and must never be read as
+    ours — ``holder_pid_checkable`` is STRICT, so a foreign or unstamped holder is not ours here.
+    """
+    from hermes_state_pidns import holder_pid_checkable
+
+    if not holder or not holder_pid_checkable(holder):
+        return False
+    pid = holder_process_pid(holder)
+    return pid is not None and pid == os.getpid()
+
+
+def same_process_holds_session_turn_lease(db, session_id: str) -> bool:
+    """True when THIS process currently holds the durable turn lease for *session_id*.
+
+    The lease is the cross-process authority over [load -> run -> flush] for a conversation, and
+    its key is the compression lineage root — so this answers "a live turn for this conversation
+    is running HERE, in this same process" even when that turn was admitted under a different
+    routing key / session twin, which the routing-key busy guards cannot see.
+
+    Callers use it to keep an AUTOMATIC (internal) turn in-process instead of entering the
+    cross-process wait: the blocking turn is in this process, so waiting cannot be resolved by any
+    other process finishing — the automatic turn must be queued behind the live one. A failed or
+    locked read, a missing reader, or a foreign/unstamped holder all answer False, which keeps
+    today's behaviour (the durable wait) for every case this function cannot prove.
+    """
+    reader = getattr(db, "session_turn_lease_holder", None)
+    if db is None or not session_id or not callable(reader):
+        return False
+    try:
+        holder = reader(session_id)
+    except Exception:
+        logger.debug(
+            "Could not read the session turn lease holder for %s; assuming not ours", session_id,
+            exc_info=True,
+        )
+        return False
+    return holder_is_this_process(str(holder or ""))
 
 
 def admit_durable_turn_lease(

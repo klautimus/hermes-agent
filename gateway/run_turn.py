@@ -2141,6 +2141,59 @@ class GatewayTurnMixin:
             title_user_message=title_user_message,
         ), _session_env_tokens
 
+    def _defer_internal_event_behind_live_turn(
+        self, event: Any, session_key: Optional[str], session_id: Optional[str],
+    ) -> bool:
+        """Queue an AUTOMATIC turn in this process when a live turn here holds its durable lease.
+
+        True = the event was accepted by the in-process pending queue; the caller must return
+        without running a turn (no lease attempt, no wait notices, no reply). False = today's
+        behaviour, untouched.
+
+        Why the durable row and not the busier maps: the lease is keyed by the conversation
+        (lineage root) while every busy guard here is keyed by ROUTING KEY, and
+        ``switch_session``/twinned sessions make key->id many-to-one (#64934) — so a live turn
+        admitted under another key holds the conversation's lease while ``_is_session_running``
+        reports the key idle. An automatic event then started a second turn on the same session,
+        which sat in ``acquire_session_turn_lease``'s cross-process wait for up to
+        ``LEASE_WAIT_SECONDS`` (1800s, spamming "Still waiting for the other Hermes process…"
+        every 15s) and was finally dropped ("Your message was not processed"). The blocking turn
+        is in THIS process, so no other process can end the wait: the event belongs in the
+        in-process queue behind the live turn, where the post-turn drain runs it.
+
+        Only internal (synthetic/automatic) events qualify — a user message keeps exactly the
+        cross-process lease semantics it has today.
+        """
+        if not session_id or not session_key or not getattr(event, "internal", False):
+            return False
+        try:
+            from gateway.run import _gateway_session_db_inner
+            db = _gateway_session_db_inner(self)
+        except Exception:
+            logger.debug("Session DB unavailable for the same-process turn lease check", exc_info=True)
+            return False
+        from agent.turn_facade_lease import same_process_holds_session_turn_lease
+        if not same_process_holds_session_turn_lease(db, session_id):
+            return False
+        adapter = self._delivery_adapter_for(event.source)
+        if adapter is None or not hasattr(adapter, "_pending_messages"):
+            # No in-process queue to hand this event to: keep the durable path rather than drop it.
+            return False
+        self._queue_or_replace_pending_event(session_key, event)
+        # Verify the event really landed: at the queue cap the helper logs and returns without
+        # storing it, and a silent drop is worse than the wait this replaces.
+        if not (
+            adapter._pending_messages.get(session_key) is event
+            or event in (self._overflow_queue(session_key) or ())
+        ):
+            return False
+        logger.info(
+            "Queued automatic turn for session %s in-process: a live turn in this process holds the "
+            "session turn lease, so no cross-process wait is entered (%s).",
+            session_id, session_key,
+        )
+        return True
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -2157,6 +2210,11 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        # Before ANY turn work (history load, typing, agent build): an automatic event whose
+        # conversation lease is held by this same process is queued behind the live turn instead of
+        # waiting on the cross-process lease.
+        if self._defer_internal_event_behind_live_turn(event, session_key, session_entry.session_id):
+            return
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
