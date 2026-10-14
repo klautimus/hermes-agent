@@ -1439,6 +1439,114 @@ class GatewayNotificationsMixin:
             return "retry"
         return "deliver"
 
+    async def _live_session_for_completion_route(self, session_db, evt: dict, row) -> Optional[str]:
+        """The thread's current live session for this completion's own route.
+
+        ``find_session_by_origin`` is the restart-proof read the resume path itself uses, so the
+        answer is the same session ``get_or_create_session(source)`` will hand the resolver
+        downstream — pinning it is a no-op re-bind rather than a route switch.
+        """
+        lookup = getattr(session_db, "find_session_by_origin", None)
+        if not callable(lookup):
+            return None  # minimal session-DB doubles: the caller's other fallbacks still apply
+        source = row or {}
+        platform = str(evt.get("platform") or source.get("source") or "").strip()
+        chat_id = str(evt.get("chat_id") or source.get("chat_id") or "").strip()
+        if not platform or not chat_id:
+            # No chat anchor (CLI / raw API session): the parent chain is the only route left.
+            return None
+        thread_id = str(evt.get("thread_id") or source.get("thread_id") or "").strip() or None
+        user_id = str(evt.get("user_id") or "").strip() or None
+        try:
+            found = await cast(Any, lookup)(
+                platform=platform, chat_id=chat_id, thread_id=thread_id, user_id=user_id,
+            )
+        except Exception:
+            logger.debug(
+                "Completion route lookup failed for %s/%s", platform, chat_id, exc_info=True,
+            )
+            return None
+        return str(found) if found else None
+
+    async def _live_session_ancestor(self, session_db, row: dict) -> Optional[str]:
+        """Nearest live ancestor through the ``parent_session_id`` chain.
+
+        A delegation child's row is never where the user reads messages, so its completion
+        belongs to the session that spawned it; the walk also covers a superseded session whose
+        successor is its own child.
+        """
+        seen = {str(row.get("id") or "")}
+        current = str(row.get("parent_session_id") or "").strip()
+        while current and current not in seen and len(seen) < 100:
+            seen.add(current)
+            try:
+                ancestor = await session_db.get_session(current)
+            except Exception:
+                logger.debug("Completion ancestor lookup failed for %s", current, exc_info=True)
+                return None
+            if ancestor is None:
+                return None
+            if not ancestor.get("ended_at"):
+                return current
+            current = str(ancestor.get("parent_session_id") or "").strip()
+        return None
+
+    async def _lineage_resolved_delivery_target(self, session_id: str, evt: dict) -> Optional[str]:
+        """A live session that should receive a completion recorded against ``session_id``.
+
+        The id was captured when the process/subagent was dispatched; by delivery time it can be
+        a delegation child's own row, or a session the thread has already superseded (/new ->
+        ``session_switch``). Resolve it through, in order, the thread's routing key and the
+        ``parent_session_id`` chain. Returns ``None`` when delivery should keep the recorded id:
+        the target is alive (today's behaviour byte-for-byte, no lookup at all), it is a
+        compression parent (its continuation has its own resolution), or nothing in the lineage
+        is live — the caller's classifier still reports that as permanently gone and drops it.
+        """
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None or not session_id:
+            return None
+        try:
+            row = await session_db.get_session(session_id)
+        except Exception:
+            logger.debug("Completion target lookup failed for %s", session_id, exc_info=True)
+            return None
+        if row is not None:
+            if not row.get("ended_at"):
+                return None  # alive: leave the record (and the delivery) exactly as it is today
+            end_reason = str(row.get("end_reason") or "")
+            if end_reason == "compression":
+                return None  # the rotation's continuation resolves separately
+            from gateway.run import _USER_BOUNDARY_END_REASONS
+            if end_reason not in _USER_BOUNDARY_END_REASONS and end_reason != "agent_close":
+                # Idle/timeout ends already retarget downstream; only the endings that LOSE the
+                # delivery today are re-resolved here — a user boundary (/new -> session_switch,
+                # session_reset, user_exit, new_session) is the classifier's "terminal" drop, and
+                # ``agent_close`` is how a delegation child's own row ends (its completion belongs
+                # to the parent, and pinning the dead child row also moves the thread's route
+                # onto it downstream).
+                return None
+        live = await self._live_session_for_completion_route(session_db, evt, row)
+        if live and live != session_id:
+            return live
+        if row is None:
+            return None
+        return await self._live_session_ancestor(session_db, row)
+
+    async def _retarget_completion_delivery(self, evt: dict) -> None:
+        """Point a synthetic completion at a live session when its recorded target is gone."""
+        recorded = str(evt.get("parent_session_id") or "").strip()
+        if not recorded:
+            return
+        resolved = await self._lineage_resolved_delivery_target(recorded, evt)
+        if not resolved or resolved == recorded:
+            return
+        logger.info(
+            "Completion recorded against session %s is delivered to its live lineage session %s "
+            "(recorded target superseded, or a delegation child's own row).",
+            recorded, resolved,
+        )
+        evt["parent_session_id"] = resolved
+
     @staticmethod
     def _settle_durable_claim(kind: str, delegation_id: str, claim_id: str) -> None:
         """Best-effort ``drop``/``release`` of a durable completion claim."""
@@ -1453,6 +1561,9 @@ class GatewayNotificationsMixin:
         """Unavailable owners/transports must not spend a durable delivery attempt."""
         from gateway.wake import adapter_supports_push
 
+        # Same lineage resolution as the durable pre-flight (idempotent: an id this call already
+        # retargeted reads back alive, so it costs one lookup and changes nothing).
+        await self._retarget_completion_delivery(evt)
         parent_session_id = str(evt.get("parent_session_id") or "").strip()
         if parent_session_id:
             verdict = await self._classify_completion_target(parent_session_id)
@@ -1488,6 +1599,10 @@ class GatewayNotificationsMixin:
         honest durable disposition.
         """
         claim = self._CompletionClaim()
+        # Resolve the dispatch-time target to a live session BEFORE the terminal decision: a
+        # delegation child's row, or a session the thread has superseded, is not a dead end while
+        # the user is still in that thread.
+        await self._retarget_completion_delivery(evt)
         evt_type = evt.get("type")
         if evt_type == "async_delegation" and not await self._completion_delivery_ready(evt):
             claim.proceed, claim.early_result = False, False
