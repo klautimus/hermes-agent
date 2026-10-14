@@ -7,10 +7,7 @@ monkeypatch points authoritative.
 
 import json
 import logging
-import os
 import sys
-from contextlib import suppress
-from pathlib import Path
 from typing import Any, List, Optional
 
 logger = logging.getLogger("tools.terminal_tool")
@@ -84,40 +81,23 @@ def _delegated_parent_session_id(session_id: str) -> str:
     A ``delegate_task`` child runs in-process with its OWN session row, and that row is never a
     place the user reads messages: a long build/dev server the child starts would report to the
     child's row, which is closed (``agent_close``) or superseded by the time it finishes, and the
-    completion was dropped. Stamp the parent session the child was spawned from instead. Outside
-    delegation the captured id is already the right target, so this returns it untouched — no
-    lookup, no behaviour change. Best-effort: any failure keeps the captured id.
+    completion was dropped. The parent session id the child was spawned from is carried on the
+    delegation context, so this needs no store lookup. Outside delegation the captured id is
+    already the right target, so it is returned untouched.
     """
     session_id = str(session_id or "").strip()
     if not session_id:
         return session_id
     try:
-        from agent.delegation_context import (
-            DELEGATED_CHILD_ENV_MARKER, is_delegated_child_context,
-        )
-        delegated = is_delegated_child_context() or bool(os.environ.get(DELEGATED_CHILD_ENV_MARKER))
+        from agent.delegation_context import delegated_parent_session_id
+        parent = str(delegated_parent_session_id() or "").strip()
     except Exception:
         return session_id
-    if not delegated:
-        return session_id
-    db = None
-    try:
-        from hermes_constants import get_hermes_home
-        from hermes_state import SessionDB
-
-        db = SessionDB(Path(get_hermes_home()) / "state.db", read_only=True)
-        row = db.get_session(session_id)
-    except Exception:
-        return session_id
-    finally:
-        if db is not None:
-            with suppress(Exception):
-                db.close()
-    parent = str((row or {}).get("parent_session_id") or "").strip()
-    if parent:
+    if parent and parent != session_id:
         logger.debug("background spawn in delegated child %s: reporting to parent %s",
                      session_id, parent)
-    return parent or session_id
+        return parent
+    return session_id
 
 
 def _stamp_gateway_routing(proc_session, get_session_env) -> None:

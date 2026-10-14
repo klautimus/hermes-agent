@@ -13,6 +13,10 @@ from contextvars import ContextVar, Token
 from typing import Iterator, Mapping, MutableMapping, overload
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_context", default=False)
+# The session that commissioned the child. Detached work a child launches (a background process, a
+# dev server) must report its completion to THIS session: the child's own row is closed with
+# ``agent_close`` when the child returns, and it is never a place the user reads messages.
+_DELEGATED_PARENT_SESSION_ID: ContextVar[str] = ContextVar("hermes_delegated_parent_session_id", default="")
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
@@ -26,18 +30,28 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 
 
 @contextmanager
-def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
+def delegated_child_context(
+    session_id: str | None = None, parent_session_id: str | None = None,
+) -> Iterator[None]:
     """Mark child execution and isolate its task-local session identity. Even a context
     entered without an id must restore the parent's session ContextVar (child
-    construction calls ``set_current_session_id``)."""
+    construction calls ``set_current_session_id``). ``parent_session_id`` names the session
+    that commissioned this child, so detached work the child launches knows where to report."""
     token = _DELEGATED_CHILD_CONTEXT.set(True)
+    parent_token = _DELEGATED_PARENT_SESSION_ID.set(str(parent_session_id or ""))
     try:
         from gateway.session_context import scoped_current_session_id  # lazy: it calls is_delegated_child_context()
 
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _DELEGATED_PARENT_SESSION_ID.reset(parent_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
+
+
+def delegated_parent_session_id() -> str:
+    """The session that commissioned this delegated child (``""`` outside a child context)."""
+    return _DELEGATED_PARENT_SESSION_ID.get()
 
 
 def is_delegated_child_context() -> bool:
