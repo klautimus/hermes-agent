@@ -464,6 +464,32 @@ def test_the_guard_leaves_an_agent_without_the_lease_reader_alone(monkeypatch):
     assert len(fork.calls) == 1
 
 
+# ── reachability boundary, asserted on purpose ───────────────────────────────────────────
+
+
+def test_a_persistence_disabled_agent_never_attempts_the_lease(monkeypatch):
+    """What the guard sits BEHIND, pinned so the assumption cannot drift silently.
+
+    ``build_cache_parity_fork`` unconditionally makes the automatic review fork
+    ``_persist_disabled`` (and drops its ``_session_db``) — agent/background_review.py, the
+    "PERSISTENCE ISOLATION" setup — and ``admit_durable_turn_lease`` returns BEFORE touching the
+    lease for a persistence-disabled agent (agent/turn_facade_lease.py). So today's automatic
+    review fork reaches its conversation with no durable lease at all: nothing to hand off, and
+    the guard above is what covers a review conversation that DOES take one (a fork that keeps
+    persistence — the shape the wait-reporting evidence is about — plus every future one). If the
+    detach is ever removed, this test fails and the guard becomes the live path.
+    """
+    db = _LeaseDb(OURS)
+    lease_agent = _lease_agent(monkeypatch, db)
+    lease_agent._persist_disabled = True  # what build_cache_parity_fork sets on every review fork
+
+    admission = _admit(lease_agent)
+
+    assert db.acquire_calls == []  # no attempted acquisition: no wait, no notice
+    assert admission.lease is None
+    assert admission.early_result is None
+
+
 # ── the spawner's payload is what the guard re-queues ────────────────────────────────────
 
 
