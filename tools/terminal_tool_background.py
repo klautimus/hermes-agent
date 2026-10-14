@@ -7,7 +7,10 @@ monkeypatch points authoritative.
 
 import json
 import logging
+import os
 import sys
+from contextlib import suppress
+from pathlib import Path
 from typing import Any, List, Optional
 
 logger = logging.getLogger("tools.terminal_tool")
@@ -75,6 +78,48 @@ def _looks_like_homebrew_ci_poller(command: str) -> bool:
     return "statusCheckRollup" in command or (has_gh and has_jq)
 
 
+def _delegated_parent_session_id(session_id: str) -> str:
+    """The session a background process launched from *session_id* must report its completion to.
+
+    A ``delegate_task`` child runs in-process with its OWN session row, and that row is never a
+    place the user reads messages: a long build/dev server the child starts would report to the
+    child's row, which is closed (``agent_close``) or superseded by the time it finishes, and the
+    completion was dropped. Stamp the parent session the child was spawned from instead. Outside
+    delegation the captured id is already the right target, so this returns it untouched — no
+    lookup, no behaviour change. Best-effort: any failure keeps the captured id.
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return session_id
+    try:
+        from agent.delegation_context import (
+            DELEGATED_CHILD_ENV_MARKER, is_delegated_child_context,
+        )
+        delegated = is_delegated_child_context() or bool(os.environ.get(DELEGATED_CHILD_ENV_MARKER))
+    except Exception:
+        return session_id
+    if not delegated:
+        return session_id
+    db = None
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db = SessionDB(Path(get_hermes_home()) / "state.db", read_only=True)
+        row = db.get_session(session_id)
+    except Exception:
+        return session_id
+    finally:
+        if db is not None:
+            with suppress(Exception):
+                db.close()
+    parent = str((row or {}).get("parent_session_id") or "").strip()
+    if parent:
+        logger.debug("background spawn in delegated child %s: reporting to parent %s",
+                     session_id, parent)
+    return parent or session_id
+
+
 def _stamp_gateway_routing(proc_session, get_session_env) -> None:
     """Copy the spawning chat's routing metadata onto the process session so
     completion / watch notifications reach the right chat/thread."""
@@ -84,6 +129,9 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
     proc_session.watcher_platform = platform
     for attr, var in _ROUTING_FIELDS:
         setattr(proc_session, attr, get_session_env(var, ""))
+    proc_session.parent_session_id = _delegated_parent_session_id(
+        getattr(proc_session, "parent_session_id", "")
+    )
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
